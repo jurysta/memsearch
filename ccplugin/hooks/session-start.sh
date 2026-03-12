@@ -12,14 +12,23 @@ if [ -z "$MEMSEARCH_CMD" ]; then
   fi
   # Warm up uvx cache with --upgrade to pull latest version
   # First run downloads packages (~2s); subsequent runs use cache (<0.3s)
-  uvx --upgrade memsearch --version &>/dev/null || true
+  uvx --upgrade --from 'memsearch[onnx]' memsearch --version &>/dev/null || true
   _detect_memsearch
 fi
 
-# Read resolved config and version for status display
-PROVIDER="openai"; MODEL=""; MILVUS_URI=""; VERSION=""
+# First-time setup: if no config file exists, default to onnx provider.
+# This avoids requiring an OPENAI_API_KEY for new ccplugin users.
+# Existing users (who already have a config file) are not affected.
 if [ -n "$MEMSEARCH_CMD" ]; then
-  PROVIDER=$($MEMSEARCH_CMD config get embedding.provider 2>/dev/null || echo "openai")
+  if [ ! -f "$HOME/.memsearch/config.toml" ] && [ ! -f "${CLAUDE_PROJECT_DIR:-.}/.memsearch.toml" ]; then
+    $MEMSEARCH_CMD config set embedding.provider onnx 2>/dev/null || true
+  fi
+fi
+
+# Read resolved config and version for status display
+PROVIDER="onnx"; MODEL=""; MILVUS_URI=""; VERSION=""
+if [ -n "$MEMSEARCH_CMD" ]; then
+  PROVIDER=$($MEMSEARCH_CMD config get embedding.provider 2>/dev/null || echo "onnx")
   MODEL=$($MEMSEARCH_CMD config get embedding.model 2>/dev/null || echo "")
   MILVUS_URI=$($MEMSEARCH_CMD config get milvus.uri 2>/dev/null || echo "")
   # "memsearch, version 0.1.10" → "0.1.10"
@@ -32,7 +41,7 @@ _required_env_var() {
     openai) echo "OPENAI_API_KEY" ;;
     google) echo "GOOGLE_API_KEY" ;;
     voyage) echo "VOYAGE_API_KEY" ;;
-    *) echo "" ;;  # ollama, local — no API key needed
+    *) echo "" ;;  # onnx, ollama, local — no API key needed
   esac
 }
 REQUIRED_KEY=$(_required_env_var "$PROVIDER")
@@ -49,8 +58,8 @@ if [ -n "$VERSION" ]; then
   LATEST=$(_json_val "$_PYPI_JSON" "info.version" "")
   if [ -n "$LATEST" ] && [ "$LATEST" != "$VERSION" ]; then
     # Detect install method to suggest the right upgrade command
-    if [ "$MEMSEARCH_CMD" = "uvx memsearch" ]; then
-      UPGRADE_CMD="uvx --upgrade memsearch --version"
+    if [[ "$MEMSEARCH_CMD" == *"uvx"* ]]; then
+      UPGRADE_CMD="uvx --upgrade --from 'memsearch[onnx]' memsearch --version"
     else
       _MS_PATH=$(command -v memsearch 2>/dev/null || true)
       if [[ "$_MS_PATH" == *"uv/tools"* ]]; then
@@ -72,6 +81,7 @@ fi
 status="[memsearch${VERSION_TAG}] embedding: ${PROVIDER}/${MODEL:-unknown} | milvus: ${MILVUS_URI:-unknown}${COLLECTION_HINT}${UPDATE_HINT}"
 if [ "$KEY_MISSING" = true ]; then
   status+=" | ERROR: ${REQUIRED_KEY} not set — memory search disabled"
+  status+=" | Tip: switch to free local embedding: memsearch config set embedding.provider onnx && memsearch index --force"
 fi
 
 # Build collection description: "<project_basename> | <provider>/<model>"
@@ -98,9 +108,22 @@ fi
 # start_watch() skips watch for Lite — file lock prevents concurrent access.
 start_watch
 
-# Lite mode: one-time index since watch is not running
+# Lite mode: one-time index since watch is not running.
+# Runs in background subshell to avoid blocking the hook (ONNX model loading takes ~10s).
+# If embedding dimension changed (e.g. user switched provider), auto-reset and re-index.
 if [[ "$MILVUS_URI" != http* ]] && [[ "$MILVUS_URI" != tcp* ]]; then
-  run_memsearch index "$MEMORY_DIR" &>/dev/null &
+  (
+    _index_args=("$MEMORY_DIR")
+    [ -n "$COLLECTION_NAME" ] && _index_args+=(--collection "$COLLECTION_NAME")
+    [ -n "$COLLECTION_DESC" ] && _index_args+=(--description "$COLLECTION_DESC")
+    INDEX_OUTPUT=$($MEMSEARCH_CMD index "${_index_args[@]}" 2>&1) || true
+    if echo "$INDEX_OUTPUT" | grep -q "dimension mismatch"; then
+      _reset_args=(--yes)
+      [ -n "$COLLECTION_NAME" ] && _reset_args+=(--collection "$COLLECTION_NAME")
+      $MEMSEARCH_CMD reset "${_reset_args[@]}" 2>/dev/null || true
+      $MEMSEARCH_CMD index "${_index_args[@]}" 2>/dev/null || true
+    fi
+  ) &
 fi
 
 # Always include status in systemMessage
