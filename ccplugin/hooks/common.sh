@@ -10,7 +10,7 @@ set -euo pipefail
 if command -v timeout &>/dev/null; then
   INPUT="$(timeout 2 cat 2>/dev/null || echo '{}')"
 else
-  INPUT="$(cat 2>/dev/null || echo '{}')"
+  INPUT="$(perl -e 'alarm 2; local $/; print <STDIN>' 2>/dev/null || echo '{}')"
 fi
 
 # Ensure common user bin paths are in PATH (hooks may run in a minimal env)
